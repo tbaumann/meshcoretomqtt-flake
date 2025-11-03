@@ -16,10 +16,13 @@
   };
 
   inputs = {
-
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     nixos-raspberrypi = {
       url = "github:nvmd/nixos-raspberrypi/main";
+    };
+    meshcoretomqtt = {
+      url = "github:tbaumann/meshcoretomqtt";
+      inputs.nixpkgs.follows = "nixos-raspberrypi/nixpkgs";
     };
 
     disko = {
@@ -32,29 +35,17 @@
     };
   };
 
-  outputs = { self, nixpkgs
-            , nixos-raspberrypi, disko
-            , nixos-anywhere, ... }@inputs: let
-    allSystems = nixpkgs.lib.systems.flakeExposed;
-    forSystems = systems: f: nixpkgs.lib.genAttrs systems (system: f system);       
-  in {
-
-    devShells = forSystems allSystems (system: let
-      pkgs = nixpkgs.legacyPackages.${system};
-    in {
-      default = pkgs.mkShell {
-        nativeBuildInputs = with pkgs; [
-          nil # lsp language server for nix
-          nixpkgs-fmt
-          nix-output-monitor
-          nixos-anywhere.packages.${system}.default
-        ];
-      };
-    });
-
+  outputs = {
+    self,
+    nixpkgs,
+    nixos-raspberrypi,
+    disko,
+    nixos-anywhere,
+    meshcoretomqtt,
+    ...
+  } @ inputs: {
     nixosConfigurations = let
-
-      users-config-stub = ({ config, ... }: {
+      users-config-stub = {config, ...}: {
         # This is identical to what nixos installer does in
         # (modulesPash + "profiles/installation-device.nix")
 
@@ -96,58 +87,89 @@
         };
 
         # allow nix-copy to live system
-        nix.settings.trusted-users = [ "nixos" ];
+        nix.settings.trusted-users = ["nixos"];
 
         # We are stateless, so just default to latest.
         system.stateVersion = config.system.nixos.release;
-      });
+      };
 
       network-config = {
-        # This is mostly portions of safe network configuration defaults that
-        # nixos-images and srvos provide
-
-        networking.useNetworkd = true;
-        # mdns
-        networking.firewall.allowedUDPPorts = [ 5353 ];
-        systemd.network.networks = {
-          "99-ethernet-default-dhcp".networkConfig.MulticastDNS = "yes";
-          "99-wireless-client-dhcp".networkConfig.MulticastDNS = "yes";
+        networking.firewall.enable = false;
+        networking.wireless.enable = true;
+        networking.wireless.networks."LJF HOMESweetHOME 2,4" = {
+          psk = "271026022807838515JFL";
         };
-
-        # This comment was lifted from `srvos`
-        # Do not take down the network for too long when upgrading,
-        # This also prevents failures of services that are restarted instead of stopped.
-        # It will use `systemctl restart` rather than stopping it with `systemctl stop`
-        # followed by a delayed `systemctl start`.
-        systemd.services = {
-          systemd-networkd.stopIfChanged = false;
-          # Services that are only restarted might be not able to resolve when resolved is stopped before
-          systemd-resolved.stopIfChanged = false;
-        };
-
-        # Use iwd instead of wpa_supplicant. It has a user friendly CLI
-        networking.wireless.enable = false;
-        networking.wireless.iwd = {
+        networking.hostName = "meshcoremqttbridge";
+        services.avahi = {
           enable = true;
-          settings = {
-            Network = {
-              EnableIPv6 = true;
-              RoutePriorityOffset = 300;
-            };
-            Settings.AutoConnect = true;
+          nssmdns4 = true;
+          publish = {
+            enable = true;
+            workstation = true;
+            addresses = true;
+            userServices = true;
           };
         };
       };
 
-      common-user-config = {config, pkgs, ... }: {
+      meshcoretomqtt-config = {
+        imports = [meshcoretomqtt.nixosModules.default];
+        services.mctomqtt = {
+          enable = true;
+          iata = "KSF";
+          serialPorts = ["/dev/ttyUSB0"];
+
+          # Disable defaults if you like.
+          # Defaults are used if nothing is specified
+          defaults = {
+            letsmesh-us.enable = true;
+            letsmesh-eu.enable = true;
+          };
+        };
+      };
+      # Disk configuration
+      # Assumes the system will continue to reside on the installation media (sd-card),
+      # as there're hardly other feasible options on RPi02.
+      # (see also https://github.com/nvmd/nixos-raspberrypi/issues/8#issuecomment-2804912881)
+      # `sd-image` has lots of dependencies unnecessary for the installed system,
+      # replicating its disk layout
+      sd-disk-config = {
+        config,
+        pkgs,
+        ...
+      }: {
+        fileSystems = {
+          "/boot/firmware" = {
+            device = "/dev/disk/by-label/FIRMWARE";
+            fsType = "vfat";
+            options = [
+              "noatime"
+              "noauto"
+              "x-systemd.automount"
+              "x-systemd.idle-timeout=1min"
+            ];
+          };
+          "/" = {
+            device = "/dev/disk/by-label/NIXOS_SD";
+            fsType = "ext4";
+            options = ["noatime"];
+          };
+        };
+      };
+
+      common-user-config = {
+        config,
+        pkgs,
+        ...
+      }: {
         imports = [
           ./modules/nice-looking-console.nix
           users-config-stub
           network-config
+          meshcoretomqtt-config
         ];
 
         time.timeZone = "UTC";
-        networking.hostName = "rpi${config.boot.loader.raspberryPi.variant}-demo";
 
         services.udev.extraRules = ''
           # Ignore partitions with "Required Partition" GPT partition attribute
@@ -161,16 +183,12 @@
           tree
         ];
 
-
         users.users.nixos.openssh.authorizedKeys.keys = [
-          # YOUR SSH PUB KEY HERE #
-
+          "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDHV2grChMteVSJYEfW4mHagZlcyAtTszKd2AfK++/6l5FLpPMdP+Ly8kLP2YO8jc3ThDBxMxhNO/SuALkcS3A/3NkswE/khyqYJFgR5gIbMNwFPerrDc7jEmSzHFIbsGOv73OEjnjiyDklYWHZYl/S5gKMLIKJEP+ou8OmmqAWmhFtd3kpkzkKgt9TMwLqcUvskyA4qzRtG0Sc9ED70lLMsLD2ymbYMDLkZTb4+KPtqJl+RTHaex6zG+WYKSWJ0J+jof4SaeITiIUaTAICx0LFYctEzwKEJ0skoDkhmi5N+UJloOIjvtdH0jNFgeju5rYFCOzmYoqiPdzAxn3Rp1Ffo9qIYDcoSWI0/K+ETw0YymoKlZS7vk4Q7kj+GiLcqCipjiMd+eKvHGdZe/6zP984DDxZo25vHRZ15VhmpEGQn4TmNcaPZTJBvy6S2RHmcnfbna/0KS2WjdEfR04x941iChDxAOi88YisT0SKBi4F8iE+pRdpydd8gdfYRQbFUnk= tilli@zuse-klappi"
         ];
         users.users.root.openssh.authorizedKeys.keys = [
-          # YOUR SSH PUB KEY HERE #
-          
+          "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDHV2grChMteVSJYEfW4mHagZlcyAtTszKd2AfK++/6l5FLpPMdP+Ly8kLP2YO8jc3ThDBxMxhNO/SuALkcS3A/3NkswE/khyqYJFgR5gIbMNwFPerrDc7jEmSzHFIbsGOv73OEjnjiyDklYWHZYl/S5gKMLIKJEP+ou8OmmqAWmhFtd3kpkzkKgt9TMwLqcUvskyA4qzRtG0Sc9ED70lLMsLD2ymbYMDLkZTb4+KPtqJl+RTHaex6zG+WYKSWJ0J+jof4SaeITiIUaTAICx0LFYctEzwKEJ0skoDkhmi5N+UJloOIjvtdH0jNFgeju5rYFCOzmYoqiPdzAxn3Rp1Ffo9qIYDcoSWI0/K+ETw0YymoKlZS7vk4Q7kj+GiLcqCipjiMd+eKvHGdZe/6zP984DDxZo25vHRZ15VhmpEGQn4TmNcaPZTJBvy6S2RHmcnfbna/0KS2WjdEfR04x941iChDxAOi88YisT0SKBi4F8iE+pRdpydd8gdfYRQbFUnk= tilli@zuse-klappi"
         ];
-
 
         system.nixos.tags = let
           cfg = config.boot.loader.raspberryPi;
@@ -181,11 +199,16 @@
         ];
       };
     in {
-
       rpi02 = nixos-raspberrypi.lib.nixosSystemFull {
         specialArgs = inputs;
         modules = [
-          ({ config, pkgs, lib, nixos-raspberrypi, ... }: {
+          ({
+            config,
+            pkgs,
+            lib,
+            nixos-raspberrypi,
+            ...
+          }: {
             imports = with nixos-raspberrypi.nixosModules; [
               # Hardware configuration
               raspberry-pi-02.base
@@ -194,34 +217,14 @@
               ./pi02-configtxt.nix
             ];
           })
-          # Disk configuration
-          # Assumes the system will continue to reside on the installation media (sd-card),
-          # as there're hardly other feasible options on RPi02.
-          # (see also https://github.com/nvmd/nixos-raspberrypi/issues/8#issuecomment-2804912881)
-          # `sd-image` has lots of dependencies unnecessary for the installed system,
-          # replicating its disk layout
-          ({ config, pkgs, ... }: {
-            fileSystems = {
-              "/boot/firmware" = {
-                device = "/dev/disk/by-label/FIRMWARE";
-                fsType = "vfat";
-                options = [
-                  "noatime"
-                  "noauto"
-                  "x-systemd.automount"
-                  "x-systemd.idle-timeout=1min"
-                ];
-              };
-              "/" = {
-                device = "/dev/disk/by-label/NIXOS_SD";
-                fsType = "ext4";
-                options = [ "noatime" ];
-              };
-            };
-          })
           # Further user configuration
           common-user-config
-          ({ config, pkgs, ... }: {
+          sd-disk-config
+          ({
+            config,
+            pkgs,
+            ...
+          }: {
             hardware.i2c.enable = true;
             environment.systemPackages = with pkgs; [
               i2c-tools
@@ -229,25 +232,47 @@
           })
         ];
       };
+      rpi3 = nixos-raspberrypi.lib.nixosSystem {
+        specialArgs = inputs;
+        modules = [
+          ({
+            config,
+            pkgs,
+            lib,
+            nixos-raspberrypi,
+            ...
+          }: {
+            imports = with nixos-raspberrypi.nixosModules; [
+              # Hardware configuration
+              raspberry-pi-3.base
+            ];
+          })
+          common-user-config
+          sd-disk-config
+          {
+            boot.tmp.useTmpfs = true;
+          }
+        ];
+      };
 
       rpi4 = nixos-raspberrypi.lib.nixosSystem {
         specialArgs = inputs;
         modules = [
-          ({ config, pkgs, lib, nixos-raspberrypi, disko, ... }: {
+          ({
+            config,
+            pkgs,
+            lib,
+            nixos-raspberrypi,
+            ...
+          }: {
             imports = with nixos-raspberrypi.nixosModules; [
               # Hardware configuration
               raspberry-pi-4.base
-              raspberry-pi-4.display-vc4
-              raspberry-pi-4.bluetooth
             ];
           })
-          # Disk configuration
-          disko.nixosModules.disko
-          # WARNING: formatting disk with disko is DESTRUCTIVE, check if
-          # `disko.devices.disk.main.device` is set correctly!
-          ./disko-usb-btrfs.nix
           # Further user configuration
           common-user-config
+          sd-disk-config
           {
             boot.tmp.useTmpfs = true;
           }
@@ -257,29 +282,35 @@
       rpi5 = nixos-raspberrypi.lib.nixosSystemFull {
         specialArgs = inputs;
         modules = [
-          ({ config, pkgs, lib, nixos-raspberrypi, disko, ... }: {
+          ({
+            config,
+            pkgs,
+            lib,
+            nixos-raspberrypi,
+            ...
+          }: {
             imports = with nixos-raspberrypi.nixosModules; [
               # Hardware configuration
               raspberry-pi-5.base
               raspberry-pi-5.page-size-16k
-              raspberry-pi-5.display-vc4
               ./pi5-configtxt.nix
+              sd-image
             ];
           })
-          # Disk configuration
-          disko.nixosModules.disko
-          # WARNING: formatting disk with disko is DESTRUCTIVE, check if
-          # `disko.devices.disk.nvme0.device` is set correctly!
-          ./disko-nvme-zfs.nix
-          { networking.hostId = "8821e309"; } # NOTE: for zfs, must be unique
           # Further user configuration
           common-user-config
+          sd-disk-config
           {
             boot.tmp.useTmpfs = true;
           }
 
           # Advanced: Use non-default kernel from kernel-firmware bundle
-          ({ config, pkgs, lib, ... }: let
+          ({
+            config,
+            pkgs,
+            lib,
+            ...
+          }: let
             kernelBundle = pkgs.linuxAndFirmware.v6_6_31;
           in {
             boot = {
@@ -290,7 +321,7 @@
 
             nixpkgs.overlays = lib.mkAfter [
               (self: super: {
-                # This is used in (modulesPath + "/hardware/all-firmware.nix") when at least 
+                # This is used in (modulesPath + "/hardware/all-firmware.nix") when at least
                 # enableRedistributableFirmware is enabled
                 # I know no easier way to override this package
                 inherit (kernelBundle) raspberrypiWirelessFirmware;
@@ -300,11 +331,8 @@
               })
             ];
           })
-
         ];
       };
-
     };
-
   };
 }
